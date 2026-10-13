@@ -680,6 +680,13 @@ class AgentCoreMemorySessionManager(RepositorySessionManager, SessionRepository)
         if session_id != self.config.session_id:
             raise SessionException(f"Session ID mismatch: expected {self.config.session_id}, got {session_id}")
 
+        if self.persistence_mode is PersistenceMode.NONE:
+            return
+
+        if isinstance(session_message.message_id, int):
+            self._update_restored_message(session_id, session_message)
+            return
+
         old_message_id = session_message.message_id
 
         # If message hasn't been persisted yet (still in buffer), update it there
@@ -752,6 +759,74 @@ class AgentCoreMemorySessionManager(RepositorySessionManager, SessionRepository)
                 )
 
         logger.info("Updated message in AgentCore Memory: replaced event %s", old_message_id)
+
+    def _update_restored_message(self, session_id: str, session_message: SessionMessage) -> None:
+        """Replace a uniquely identified payload without moving or dropping its siblings."""
+        events = self.memory_client.list_events(
+            memory_id=self.config.memory_id,
+            actor_id=self.config.actor_id,
+            session_id=session_id,
+            max_results=MAX_FETCH_ALL_RESULTS,
+        )
+        matches = []
+        for event in events:
+            for index, item in enumerate(event.get("payload", [])):
+                messages = self.converter.events_to_messages([{**event, "payload": [item]}])
+                if len(messages) == 1:
+                    original = messages[0]
+                    if (
+                        original.message_id == session_message.message_id
+                        and original.created_at == session_message.created_at
+                    ):
+                        matches.append((event, index))
+        if len(matches) != 1:
+            raise SessionException("Cannot uniquely resolve restored message to an AgentCore event payload")
+
+        old_event, index = matches[0]
+        converted = self.converter.message_to_payload(session_message)
+        if len(converted) != 1:
+            raise SessionException("Updated message must produce exactly one payload")
+        text, role = converted[0]
+        replacement: dict[str, Any]
+        if self.converter.exceeds_conversational_limit(converted[0]):
+            replacement = {"blob": json.dumps(converted[0])}
+        else:
+            replacement = {"conversational": {"content": {"text": text}, "role": role.upper()}}
+        payload = list(old_event["payload"])
+        payload[index] = replacement
+        create_kwargs = {
+            "memoryId": self.config.memory_id,
+            "actorId": self.config.actor_id,
+            "sessionId": session_id,
+            "payload": payload,
+            # Keep the event in its original position, including batched siblings.
+            "eventTimestamp": old_event["eventTimestamp"],
+        }
+        if old_event.get("metadata"):
+            create_kwargs["metadata"] = old_event["metadata"]
+        if old_event.get("branch"):
+            create_kwargs["branch"] = old_event["branch"]
+        new_event = self.memory_client.gmdp_client.create_event(**create_kwargs)["event"]
+        try:
+            self.memory_client.gmdp_client.delete_event(
+                memoryId=self.config.memory_id,
+                actorId=self.config.actor_id,
+                sessionId=session_id,
+                eventId=old_event["eventId"],
+            )
+        except Exception as delete_error:
+            try:
+                self.memory_client.gmdp_client.delete_event(
+                    memoryId=self.config.memory_id,
+                    actorId=self.config.actor_id,
+                    sessionId=session_id,
+                    eventId=new_event["eventId"],
+                )
+            except Exception as rollback_error:
+                raise SessionException(
+                    f"Message update and rollback failed; both events may exist: {rollback_error}"
+                ) from delete_error
+            raise SessionException(f"Failed to update message: {delete_error}") from delete_error
 
     def list_messages(
         self,
